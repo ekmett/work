@@ -20,6 +20,8 @@ target_sources(work PUBLIC FILE_SET modules TYPE CXX_MODULES
 target_link_libraries(work PUBLIC hint::hint Threads::Threads)
 set_target_properties(work PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
+  # CMake's module rule passes -TP beside an explicit Clang module input mode.
+  target_compile_options(work PUBLIC -Wno-unused-command-line-argument)
   target_compile_options(work PRIVATE /W4 /WX)
 else()
   target_compile_options(work PRIVATE -Wall -Wextra -Werror)

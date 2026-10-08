@@ -3,7 +3,7 @@
 <!-- SPDX-FileCopyrightText: 2026 Edward Kmett <ekmett@gmail.com> -->
 <!-- SPDX-License-Identifier: BSD-2-Clause OR Apache-2.0 -->
 
-A pool does the work. A gig says when you're done.
+A pool does the work. A gig is a bunch of related work.
 
 ```cpp
 #include <new>
