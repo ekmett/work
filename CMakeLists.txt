@@ -34,11 +34,13 @@ endif()
 option(WORK_BUILD_DOCS "Build work API documentation" OFF)
 if(WORK_BUILD_DOCS)
   find_package(Doxygen 1.18 REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  find_program(PANDOC_EXECUTABLE pandoc REQUIRED)
   set(DOXYGEN_PROJECT_NAME work)
   set(DOXYGEN_PROJECT_BRIEF "A gig is a bunch of related work. The pool does the work.")
   set(DOXYGEN_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/docs")
   set(DOXYGEN_USE_MDFILE_AS_MAINPAGE "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
-  set(DOXYGEN_HTML_EXTRA_STYLESHEET "${CMAKE_CURRENT_SOURCE_DIR}/docs/site.css")
+
   set(DOXYGEN_GENERATE_LATEX NO)
   set(DOXYGEN_GENERATE_TREEVIEW YES)
   set(DOXYGEN_HTML_DYNAMIC_MENUS NO)
@@ -67,6 +69,11 @@ if(WORK_BUILD_DOCS)
     COMMAND "${CMAKE_COMMAND}" -E rm -rf "${CMAKE_CURRENT_BINARY_DIR}/docs/html"
     VERBATIM)
   add_dependencies(work-docs work-docs-clean)
+  add_custom_command(TARGET work-docs POST_BUILD
+    COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/docs/site/build.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/docs/html"
+      "${CMAKE_CURRENT_BINARY_DIR}/site" --name work --pandoc "${PANDOC_EXECUTABLE}"
+    VERBATIM)
 endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

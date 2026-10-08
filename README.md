@@ -106,9 +106,9 @@ particularly its sender-initiated scheduler. This implementation uses its own
 batch dispatch and completion protocol; it does not inherit the paper's proofs.
 
 The [API reference](https://ekmett.github.io/work/) is built and published by CI.
-To build it locally, install Doxygen 1.18+ and configure with
+To build it locally, install Doxygen 1.18+, Pandoc 3.8+ and Python 3, and configure with
 `-DWORK_BUILD_DOCS=ON`, then run `cmake --build build --target work-docs`.
-The generated site is in `build/docs/html/`.
+The generated site is in `build/site/`.
 
 ## Contact
 

@@ -238,11 +238,11 @@ third-party archives.
     See the License for the specific language governing permissions and
     limitations under the License.
 
-## Documentation stylesheet
+## Documentation site
 
-`docs/site.css` adapts THC's documentation stylesheet and retains its
+The assets in `docs/site/` adapted from THC retain their
 UPL-1.0 AND BSD-3-Clause terms. The following upstream notice applies to that
-stylesheet, not to the Work library.
+assets, not to the Work library.
 
 ```text
 SPDX-License-Identifier: UPL-1.0 AND BSD-3-Clause
