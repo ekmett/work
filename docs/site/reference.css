@@ -158,3 +158,8 @@ a:focus-visible, input:focus-visible, button:focus-visible {
   .contents > .textblock { font-size: 16px; }
   div.fragment { padding: 12px; }
 }
+
+/* The enclosing site already provides the project header and left rail. */
+html[data-thc-embedded] #titlearea,
+html[data-thc-embedded] #side-nav { display: none; }
+html[data-thc-embedded] #doc-content { margin-left: 0 !important; }
