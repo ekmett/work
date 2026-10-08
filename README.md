@@ -25,7 +25,7 @@ int main() {
 ```
 
 Make another gig with another task type and handler. They can overlap. The pool
-keeps its threads; each gig owns its handler and task storage. `close()` stops
+keeps its threads; each `work::gig<T, Handler>` owns its handler and task storage. `close()` stops
 external submissions. `join()` waits for that gig and all its descendants, and
 makes their writes visible to the caller. It also closes the gig if necessary.
 Destruction joins, so keep things captured by reference alive until then.

@@ -26,11 +26,12 @@ int main() {
     for (unsigned round = 0; round != 8; ++round) {
       constexpr unsigned count = 32767;
       std::vector<std::atomic<unsigned>> seen(count + 1);
-      auto g = pool.gig<unsigned>([&](unsigned value, work::context<unsigned> & children) noexcept {
+      auto handler = [&](unsigned value, work::context<unsigned> & children) noexcept {
         check(value && value <= count);
         check(seen[value].fetch_add(1, std::memory_order_relaxed) == 0);
         if (value * 2 <= count) { children.push(value * 2); children.push(value * 2 + 1); }
-      });
+      };
+      work::gig<unsigned, decltype(handler)> g = pool.gig<unsigned>(handler);
       g.push(1); g.close(); g.join(); g.join();
       for (unsigned value = 1; value <= count; ++value) check(seen[value] == 1);
       bool rejected = false;

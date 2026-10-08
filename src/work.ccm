@@ -31,7 +31,7 @@ template<class T>
 concept task = std::is_nothrow_move_constructible_v<T> &&
                std::is_nothrow_move_assignable_v<T> && std::is_nothrow_destructible_v<T>;
 template<task T> class context;
-template<task T, class Handler> class task_group;
+template<task T, class Handler> class gig;
 /// \brief A handler consumes a task, optionally with a borrowed child-submission context.
 template<class Handler, class T>
 concept handler_for = task<T> &&
@@ -82,7 +82,7 @@ template<task T> struct state;
 /// not block waiting for other pool work: join() cooperates instead.
 class pool {
   template<task T> friend struct detail::state;
-  template<task T, class Handler> friend class task_group;
+  template<task T, class Handler> friend class work::gig;
   std::size_t const width;
   std::mutex mutex;
   std::condition_variable ready;
@@ -226,7 +226,7 @@ struct state {
 /// Never share this context with another thread or retain it after the callback.
 template<task T>
 class context {
-  template<task U, class Handler> friend class task_group;
+  template<task U, class Handler> friend class work::gig;
   using state = detail::state<T>;
   state & owner;
   typename state::lane & local;
@@ -260,20 +260,20 @@ public:
 /// push() and close() may race: the gig mutex determines whether push is accepted.
 /// The handler and all borrowed captures must remain valid until join returns.
 template<task T, class Handler>
-class task_group {
+class gig {
   friend class pool;
   Handler handler;
   detail::state<T> state;
   std::mutex caller_join;
   using lane = typename detail::state<T>::lane;
   template<class H>
-  task_group(pool & workers, H && fn, gig_options options) noexcept
+  gig(pool & workers, H && fn, gig_options options) noexcept
       : handler(std::forward<H>(fn)), state(workers, options) {
     for (auto & local : state.lanes) { local->run = &execute; local->group = this; }
   }
   static void execute(detail::activation * raw) noexcept {
     auto & local = *static_cast<lane *>(raw);
-    auto & self = *static_cast<task_group *>(const_cast<void *>(local.group));
+    auto & self = *static_cast<gig *>(const_cast<void *>(local.group));
     auto & state = self.state;
     context<T> queue{state, local};
     // Only the activation boundary is erased. Handler and T remain concrete.
@@ -298,8 +298,8 @@ class task_group {
     state.yield(local);
   }
 public:
-  task_group(task_group const &) = delete;
-  task_group & operator=(task_group const &) = delete;
+  gig(gig const &) = delete;
+  gig & operator=(gig const &) = delete;
   /// \brief Submit external work. Throws logic_error if close() won the race.
   void push(T value) {
     std::lock_guard lock(state.mutex);
@@ -334,12 +334,12 @@ public:
     } else state.workers.help(state.done);
   }
   /// \brief Close and join before releasing handler and task storage.
-  ~task_group() noexcept { join(); }
+  ~gig() noexcept { join(); }
 };
 
 template<task T, class Handler> requires handler_for<std::decay_t<Handler>, T>
 auto pool::gig(Handler && handler, gig_options options) noexcept {
-  return task_group<T, std::decay_t<Handler>>{*this, std::forward<Handler>(handler), options};
+  return work::gig<T, std::decay_t<Handler>>{*this, std::forward<Handler>(handler), options};
 }
 }
 
