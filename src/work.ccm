@@ -1,0 +1,401 @@
+// SPDX-FileCopyrightText: 2026 Edward Kmett <ekmett@gmail.com>
+// SPDX-License-Identifier: BSD-2-Clause OR Apache-2.0
+
+/// \file
+/// \brief Typed gigs with private stacks and stochastic work pushing.
+module;
+#include <hint.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <concepts>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <random>
+#include <span>
+#include <stdexcept>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+export module work;
+
+export namespace work {
+/// \brief Tasks can move between workers without throwing.
+template<class T>
+concept task = std::is_nothrow_move_constructible_v<T> &&
+               std::is_nothrow_move_assignable_v<T> && std::is_nothrow_destructible_v<T>;
+template<task T> class context;
+template<task T, class Handler> class task_group;
+/// \brief A handler consumes a task, optionally with a borrowed child-submission context.
+template<class Handler, class T>
+concept handler_for = task<T> &&
+  (std::is_nothrow_invocable_v<Handler &, T, context<T> &> ||
+   std::is_nothrow_invocable_v<Handler &, T> ||
+   std::is_nothrow_invocable_v<Handler &, context<T> &>);
+/// \brief Bound a gig's concurrency or keep all its callbacks on the joining caller.
+struct gig_options {
+  std::size_t concurrency = 0; ///< Zero uses the pool's full width.
+  bool caller_only = false; ///< Work starts in join(), on that caller alone.
+};
+
+namespace detail {
+inline constexpr unsigned batch_limit = 4096;
+struct activation {
+  activation * next = nullptr;
+  void (*run)(activation *) noexcept = nullptr;
+  void const * group = nullptr;
+};
+struct binding {
+  inline static thread_local binding * current = nullptr;
+  binding * previous = current;
+  void const * group;
+  explicit binding(void const * value) noexcept : group(value) { current = this; }
+  ~binding() noexcept { current = previous; }
+};
+// Sender-initiated private queues: Acar/Chargueraud/Rainey, PPoPP 2013,
+// Figure 3. Deadlines accumulate rather than resetting to observation time.
+struct donation_clock {
+  using clock = std::chrono::steady_clock;
+  std::minstd_rand random;
+  std::exponential_distribution<double> interval{1.0 / 30'000.0};
+  clock::time_point deadline;
+  explicit donation_clock(unsigned seed) noexcept
+      : random(seed + 1), deadline(clock::now()) { advance(); }
+  void advance() noexcept {
+    auto const ns = std::chrono::nanoseconds{
+      std::max(std::int64_t{1}, static_cast<std::int64_t>(interval(random)))};
+    deadline += std::max(clock::duration{1}, std::chrono::duration_cast<clock::duration>(ns));
+  }
+};
+template<task T> struct state;
+}
+
+/// \brief Persistent workers shared by independent, overlapping typed gigs.
+/// The width includes one cooperating join caller; width one needs join() to
+/// make progress. A pool must outlive every gig made from it. Callbacks should
+/// not block waiting for other pool work: join() cooperates instead.
+class pool {
+  template<task T> friend struct detail::state;
+  template<task T, class Handler> friend class task_group;
+  std::size_t const width;
+  std::mutex mutex;
+  std::condition_variable ready;
+  detail::activation * first = nullptr;
+  detail::activation * last = nullptr;
+  bool stopping = false;
+  std::vector<std::jthread> threads;
+
+  void schedule(detail::activation & job) noexcept;
+  void notify() noexcept;
+  [[nodiscard]] detail::activation * take() noexcept;
+  static void execute(detail::activation * job) noexcept;
+  void worker() noexcept;
+  void help(std::atomic<bool> const & done) noexcept;
+public:
+  /// \brief Create a pool whose width includes the joining caller.
+  explicit pool(std::size_t workers = 1) noexcept;
+  pool(pool const &) = delete;
+  pool & operator=(pool const &) = delete;
+  /// \pre All gigs have been destroyed.
+  ~pool() noexcept;
+  /// \brief Maximum number of lanes in a gig by default.
+  [[nodiscard]] hint_inline hint_pure std::size_t workers() const noexcept { return width; }
+  /// \brief Preserve caller-only execution for nested bulk phases.
+  [[nodiscard]] hint_inline hint_pure std::size_t available_workers() const noexcept {
+    return detail::binding::current ? 1 : width;
+  }
+  /// \brief Create a typed gig. Handler invocations may overlap and must be thread safe.
+  template<task T, class Handler> requires handler_for<std::decay_t<Handler>, T>
+  [[nodiscard]] auto gig(Handler && handler, gig_options options = {}) noexcept;
+};
+
+namespace detail {
+template<task T>
+struct state {
+  struct alignas(64) lane : activation {
+    state * owner;
+    std::size_t index;
+    std::vector<T> pending; // Only the active lane's executor may touch this.
+    donation_clock timer;
+    bool active = false; // Protected by mutex, including while queued/in transit.
+    lane(state & s, std::size_t i) noexcept : owner(&s), index(i), timer(static_cast<unsigned>(i)) {}
+  };
+  pool & workers;
+  bool const caller_only;
+  std::vector<std::unique_ptr<lane>> lanes;
+  std::mutex mutex;
+  std::vector<T> incoming; // External producers only touch this under mutex.
+  std::size_t active = 0; // Counts reservations, queued activations and running lanes.
+  bool closed = false;
+  std::atomic<bool> done{false};
+
+  state(pool & p, gig_options options) noexcept
+      : workers(p), caller_only(options.caller_only) {
+    auto const n = caller_only ? 1 : std::min(p.workers(), options.concurrency ? options.concurrency : p.workers());
+    for (std::size_t i = 0; i != n; ++i) lanes.push_back(std::make_unique<lane>(*this, i));
+  }
+  // mutex is held. Publish only after moving the batch and counting its owner.
+  void dispatch() noexcept {
+    if (incoming.empty()) return;
+    if (!active) {
+      // A new busy period excludes arbitrary open-idle time. Within that
+      // period, keep accumulating deadlines across donations and resumption.
+      auto const now = donation_clock::clock::now();
+      for (auto & target : lanes) { target->timer.deadline = now; target->timer.advance(); }
+    }
+    for (auto & target : lanes) if (!target->active) {
+      target->pending.swap(incoming);
+      target->active = true;
+      ++active;
+      if (!caller_only) workers.schedule(*target);
+      return;
+    }
+  }
+  void close() noexcept {
+    {
+      std::lock_guard lock(mutex);
+      closed = true;
+      if (!active) done.store(true, std::memory_order_release);
+    }
+    workers.notify();
+  }
+  // Called only with an empty owner stack. The mutex arbitrates final retirement
+  // against external push/close; a live callback always owns a counted lane.
+  [[nodiscard]] bool refill(lane & source) noexcept {
+    pool * wake = &workers;
+    bool completed = false;
+    {
+      std::lock_guard lock(mutex);
+      if (!incoming.empty()) { source.pending.swap(incoming); return true; }
+      source.active = false;
+      --active;
+      if (closed && !active) {
+        done.store(true, std::memory_order_release);
+        completed = true;
+      }
+    }
+    // No access to state after publication of completion: join may destroy it.
+    if (completed) wake->notify();
+    return false;
+  }
+  void yield(lane & source) noexcept {
+    {
+      std::lock_guard lock(mutex);
+      // Admit external work even when descendants keep the local stack full.
+      for (auto & item : incoming) source.pending.push_back(std::move(item));
+      incoming.clear();
+    }
+    if (!caller_only) workers.schedule(source); // Last access if another executor acquires it.
+  }
+  void donate(lane & source, std::size_t peer) noexcept {
+    if (source.pending.size() < 2 || peer == source.index) return;
+    std::unique_lock lock(mutex, std::try_to_lock);
+    auto & target = *lanes[peer];
+    if (!lock || target.active) return;
+    auto const half = source.pending.size() / 2;
+    // Handoffs stay typed. The mutex is off the owner-local push/pop path.
+    for (std::size_t i = 0; i != half; ++i) target.pending.push_back(std::move(source.pending[i]));
+    source.pending.erase(source.pending.begin(), source.pending.begin() + half);
+    target.active = true;
+    ++active;
+    workers.schedule(target);
+  }
+  hint_inline void poll(lane & source) noexcept {
+    if (!caller_only && lanes.size() > 1) communicate(source);
+  }
+  hint_noinline void communicate(lane & source) noexcept {
+    auto & timer = source.timer;
+    while (timer.deadline <= donation_clock::clock::now()) {
+      auto peer = std::uniform_int_distribution<std::size_t>{0, lanes.size() - 2}(timer.random);
+      if (peer >= source.index) ++peer;
+      donate(source, peer);
+      timer.advance();
+    }
+  }
+};
+}
+
+/// \brief Borrowed owner-local submissions; valid only during its handler call.
+/// Children are accepted after close(): they belong to the already accepted task.
+/// Never share this context with another thread or retain it after the callback.
+template<task T>
+class context {
+  template<task U, class Handler> friend class task_group;
+  using state = detail::state<T>;
+  state & owner;
+  typename state::lane & local;
+  unsigned remaining = detail::batch_limit;
+  context(state & s, typename state::lane & l) noexcept : owner(s), local(l) {}
+public:
+  context(context const &) = delete;
+  /// \brief Push a child on this worker's private stack without synchronization.
+  hint_inline void push(T value) noexcept { local.pending.push_back(std::move(value)); }
+  /// \brief Donate older queued work when the accumulated stochastic deadline is due.
+  hint_inline void poll() noexcept { owner.poll(local); }
+  /// \brief Pop one task in a context-only batch handler, up to this activation's quantum.
+  /// False ends this batch, not necessarily the gig. Only the batch handler may
+  /// consume tasks; contexts passed alongside a task are for child submission.
+  [[nodiscard]] hint_inline bool pop(T & result) noexcept {
+    if (!remaining || local.pending.empty()) return false;
+    poll();
+    result = std::move(local.pending.back());
+    local.pending.pop_back();
+    --remaining;
+    return true;
+  }
+  /// \brief This activation's lane index, stable for the lifetime of the callback.
+  [[nodiscard]] hint_inline hint_pure std::size_t index() const noexcept { return local.index; }
+};
+
+/// \brief A typed, nonmovable lifetime boundary for submitted tasks and descendants.
+/// Each accepted task runs exactly once. close() is idempotent and rejects later
+/// external pushes; contexts may still create children. join() closes and waits
+/// for all descendants, publishing their writes to the caller. Destruction joins.
+/// push() and close() may race: the gig mutex determines whether push is accepted.
+/// The handler and all borrowed captures must remain valid until join returns.
+template<task T, class Handler>
+class task_group {
+  friend class pool;
+  Handler handler;
+  detail::state<T> state;
+  std::mutex caller_join;
+  using lane = typename detail::state<T>::lane;
+  template<class H>
+  task_group(pool & workers, H && fn, gig_options options) noexcept
+      : handler(std::forward<H>(fn)), state(workers, options) {
+    for (auto & local : state.lanes) { local->run = &execute; local->group = this; }
+  }
+  static void execute(detail::activation * raw) noexcept {
+    auto & local = *static_cast<lane *>(raw);
+    auto & self = *static_cast<task_group *>(const_cast<void *>(local.group));
+    auto & state = self.state;
+    context<T> queue{state, local};
+    // Only the activation boundary is erased. Handler and T remain concrete.
+    // Context-only handlers can bind TLS/RAII once and drain the bounded batch.
+    if constexpr (!std::is_nothrow_invocable_v<Handler &, T, context<T> &> &&
+                  !std::is_nothrow_invocable_v<Handler &, T>) {
+      std::invoke(self.handler, queue);
+    } else {
+      for (unsigned i = 0; i != detail::batch_limit && !local.pending.empty(); ++i) {
+        {
+          T value{std::move(local.pending.back())};
+          local.pending.pop_back();
+          if constexpr (std::is_nothrow_invocable_v<Handler &, T, context<T> &>)
+            std::invoke(self.handler, std::move(value), queue);
+          else std::invoke(self.handler, std::move(value));
+        }
+        queue.poll();
+      }
+    }
+    // Publish retirement only after the handler and its batch scopes end.
+    if (local.pending.empty() && !state.refill(local)) return;
+    state.yield(local);
+  }
+public:
+  task_group(task_group const &) = delete;
+  task_group & operator=(task_group const &) = delete;
+  /// \brief Submit external work. Throws logic_error if close() won the race.
+  void push(T value) {
+    std::lock_guard lock(state.mutex);
+    if (state.closed) throw std::logic_error("work: push into a closed gig");
+    state.incoming.push_back(std::move(value));
+    state.dispatch();
+  }
+  /// \brief Submit a copied batch under one admission lock.
+  void push(std::span<T const> values) requires std::copy_constructible<T> {
+    std::lock_guard lock(state.mutex);
+    if (state.closed) throw std::logic_error("work: push into a closed gig");
+    // Copy first so a failed allocation/copy cannot leave unaccounted work.
+    std::vector<T> batch(values.begin(), values.end());
+    state.incoming.reserve(state.incoming.size() + batch.size());
+    for (auto & value : batch) state.incoming.push_back(std::move(value));
+    state.dispatch();
+  }
+  /// \brief Stop external submissions. Already accepted descendants still run.
+  void close() noexcept { state.close(); }
+  /// \brief Close and cooperatively await completion. Repeated joins are harmless.
+  /// \pre Do not join this gig from its own callback or a callback nested inside it.
+  void join() noexcept {
+    for (auto * at = detail::binding::current; at; at = at->previous)
+      if (at->group == this) std::terminate();
+    std::unique_lock lock(caller_join, std::defer_lock);
+    // Ordinary joins must stay cooperative: helping B while joining A can
+    // legitimately enter a B callback that also joins A.
+    if (state.caller_only) lock.lock();
+    close();
+    if (state.caller_only) {
+      while (!state.done.load(std::memory_order_acquire)) pool::execute(state.lanes[0].get());
+    } else state.workers.help(state.done);
+  }
+  /// \brief Close and join before releasing handler and task storage.
+  ~task_group() noexcept { join(); }
+};
+
+template<task T, class Handler> requires handler_for<std::decay_t<Handler>, T>
+auto pool::gig(Handler && handler, gig_options options) noexcept {
+  return task_group<T, std::decay_t<Handler>>{*this, std::forward<Handler>(handler), options};
+}
+}
+
+namespace work {
+void pool::schedule(detail::activation & job) noexcept {
+  {
+    std::lock_guard lock(mutex);
+    job.next = nullptr;
+    if (last) last->next = &job; else first = &job;
+    last = &job;
+  }
+  ready.notify_one();
+}
+void pool::notify() noexcept {
+  // Pair with the condition-variable wait's mutex to prevent a completion
+  // notification from falling between its predicate check and actual wait.
+  std::lock_guard lock(mutex);
+  ready.notify_all();
+}
+detail::activation * pool::take() noexcept {
+  auto * job = first;
+  first = job->next;
+  if (!first) last = nullptr;
+  return job;
+}
+void pool::execute(detail::activation * job) noexcept {
+  auto const run = job->run;
+  detail::binding scope{job->group};
+  run(job); // Must not touch job again: the callback can publish its retirement.
+}
+void pool::worker() noexcept {
+  for (;;) {
+    std::unique_lock lock(mutex);
+    ready.wait(lock, [&] { return stopping || first; });
+    if (stopping) return;
+    auto * job = take();
+    lock.unlock();
+    execute(job);
+  }
+}
+void pool::help(std::atomic<bool> const & done) noexcept {
+  while (!done.load(std::memory_order_acquire)) {
+    std::unique_lock lock(mutex);
+    ready.wait(lock, [&] { return first || done.load(std::memory_order_acquire); });
+    if (done.load(std::memory_order_acquire)) return;
+    auto * job = take();
+    lock.unlock();
+    execute(job);
+  }
+}
+pool::pool(std::size_t workers) noexcept : width(std::max(workers, std::size_t{1})) {
+  for (std::size_t i = 1; i != width; ++i) threads.emplace_back([this] { worker(); });
+}
+pool::~pool() noexcept {
+  { std::lock_guard lock(mutex); stopping = true; }
+  ready.notify_all();
+  threads.clear();
+}
+}

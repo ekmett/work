@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 Edward Kmett <ekmett@gmail.com>
+# SPDX-License-Identifier: BSD-2-Clause OR Apache-2.0
+name: Build and test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6, Node 24
+      - name: Install compiler and build tools
+        run: |
+          curl --fail --location --retry 3 https://apt.llvm.org/llvm.sh --output "$RUNNER_TEMP/llvm.sh"
+          sudo bash "$RUNNER_TEMP/llvm.sh" 23
+          sudo apt-get install --no-install-recommends -y clang-tools-23 python3-venv
+          echo /usr/lib/llvm-23/bin >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/build-tools"
+          "$RUNNER_TEMP/build-tools/bin/python" -m pip install cmake==4.4.3 ninja==1.13.0
+          echo "$RUNNER_TEMP/build-tools/bin" >> "$GITHUB_PATH"
+      - run: cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build -j4
+      - run: ctest --test-dir build --output-on-failure
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6, Node 24
+      - uses: ekmett/native/.github/actions/setup/windows@385b740751005952434d10e4ee1c1d3fd1f4766b
+      - run: cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build -j4
+      - run: ctest --test-dir build --output-on-failure
