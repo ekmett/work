@@ -39,7 +39,18 @@ if(WORK_BUILD_DOCS)
   set(DOXYGEN_PROJECT_NAME work)
   set(DOXYGEN_PROJECT_BRIEF "A gig is a bunch of related work. The pool does the work.")
   set(DOXYGEN_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/docs")
-  set(DOXYGEN_USE_MDFILE_AS_MAINPAGE "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+  # Render linked badges as inline HTML for Doxygen; Pandoc uses the original.
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS README.md)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/README.md" docs_readme)
+  string(REGEX REPLACE "\\[!\\[([^]]*)\\]\\(([^)]+)\\)\\]\\(([^):]+)\\)"
+    "<a href=\"https://github.com/ekmett/work/blob/main/\\3\"><img src=\"\\2\" alt=\"\\1\" /></a>"
+    docs_readme "${docs_readme}")
+  string(REGEX REPLACE "\\[!\\[([^]]*)\\]\\(([^)]+)\\)\\]\\((https?://[^)]+)\\)"
+    "<a href=\"\\3\"><img src=\"\\2\" alt=\"\\1\" /></a>"
+    docs_readme "${docs_readme}")
+  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/markdown")
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/markdown/README.md" "${docs_readme}")
+  set(DOXYGEN_USE_MDFILE_AS_MAINPAGE "${CMAKE_CURRENT_BINARY_DIR}/markdown/README.md")
 
   set(DOXYGEN_GENERATE_LATEX NO)
   set(DOXYGEN_GENERATE_TREEVIEW YES)
@@ -62,7 +73,8 @@ if(WORK_BUILD_DOCS)
   set(DOXYGEN_WARN_AS_ERROR FAIL_ON_WARNINGS)
   set(DOXYGEN_WARN_LOGFILE "${CMAKE_CURRENT_BINARY_DIR}/docs/warnings.log")
   set(DOXYGEN_QUIET YES)
-  doxygen_add_docs(work-docs src/work.ccm README.md LICENSE.md
+  doxygen_add_docs(work-docs src/work.ccm
+    "${CMAKE_CURRENT_BINARY_DIR}/markdown/README.md" LICENSE.md CODE_OF_CONDUCT.md
     COMMENT "Build work API documentation")
   # Removed declarations must not leave stale pages in the generated reference.
   add_custom_target(work-docs-clean
@@ -70,6 +82,8 @@ if(WORK_BUILD_DOCS)
     VERBATIM)
   add_dependencies(work-docs work-docs-clean)
   add_custom_command(TARGET work-docs POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+      "${CMAKE_CURRENT_SOURCE_DIR}/assets/badges" "${CMAKE_CURRENT_BINARY_DIR}/docs/html/assets/badges"
     COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/docs/site/build.py"
       "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/docs/html"
       "${CMAKE_CURRENT_BINARY_DIR}/site" --name work --pandoc "${PANDOC_EXECUTABLE}"
