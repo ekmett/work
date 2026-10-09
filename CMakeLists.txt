@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(FetchContent)
 if(NOT TARGET hint::hint)
   FetchContent_Declare(hint GIT_REPOSITORY https://github.com/ekmett/hint.git
-    GIT_TAG 9685ad404b57075a8e91fa3deef9c3fd759b7237 FIND_PACKAGE_ARGS 0.1 CONFIG)
+    GIT_TAG main FIND_PACKAGE_ARGS 0.1 CONFIG)
   FetchContent_MakeAvailable(hint)
 endif()
 find_package(Threads REQUIRED)
